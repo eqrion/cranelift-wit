@@ -1,0 +1,12 @@
+[package]
+name = "cranelift-wit"
+version = "0.1.0"
+authors = ["Ryan Hunt <rhunt@eqrion.net>"]
+edition = "2018"
+
+[dependencies]
+cranelift-entity = "0.51"
+cranelift-codegen = "0.51"
+cranelift-frontend = "0.51"
+wasmparser = "0.39"
+wit-parser = { path = "deps/wasm-interface-types/crates/parser" }
