@@ -295,6 +295,18 @@ impl Interface {
                     stack.append(&mut results);
                 }
 
+                Instruction::I32Store(store) |
+                Instruction::I32Store16(store) |
+                Instruction::I32Store8(store) |
+                Instruction::I64Store(store) |
+                Instruction::I64Store32(store) |
+                Instruction::I64Store16(store) |
+                Instruction::I64Store8(store) => {
+                    assert!(store.mem == 0);
+                    let addr = stack.pop().unwrap().core_to_ir();
+                    let val = stack.pop().unwrap().core_to_ir();
+                    builder.ins().store(ir::MemFlags::trusted(), val, addr, store.offset as i32);
+                },
                 _ => unimplemented!(),
             }
         }
@@ -691,6 +703,14 @@ pub enum Instruction {
     U32ToI64,
     S64ToI64,
     U64ToI64,
+
+    I32Store(Store),
+    I32Store16(Store),
+    I32Store8(Store),
+    I64Store(Store),
+    I64Store32(Store),
+    I64Store16(Store),
+    I64Store8(Store),
 }
 
 impl From<wit_parser::Instruction> for Instruction {
@@ -746,6 +766,14 @@ impl From<wit_parser::Instruction> for Instruction {
             wit_parser::Instruction::U32ToI64 => Instruction::U32ToI64,
             wit_parser::Instruction::S64ToI64 => Instruction::S64ToI64,
             wit_parser::Instruction::U64ToI64 => Instruction::U64ToI64,
+
+            wit_parser::Instruction::I32Store(store) => Instruction::I32Store(store.into()),
+            wit_parser::Instruction::I32Store16(store) => Instruction::I32Store16(store.into()),
+            wit_parser::Instruction::I32Store8(store) => Instruction::I32Store8(store.into()),
+            wit_parser::Instruction::I64Store(store) => Instruction::I64Store(store.into()),
+            wit_parser::Instruction::I64Store32(store) => Instruction::I64Store32(store.into()),
+            wit_parser::Instruction::I64Store16(store) => Instruction::I64Store16(store.into()),
+            wit_parser::Instruction::I64Store8(store) => Instruction::I64Store8(store.into()),
         }
     }
 }
@@ -761,6 +789,21 @@ impl From<wit_parser::StringToMemory> for StringToMemory {
         StringToMemory {
             malloc: string_to_memory.malloc as usize,
             mem: string_to_memory.mem as usize,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Store {
+    offset: u32,
+    mem: MemoryIdx,
+}
+
+impl From<wit_parser::Store> for Store {
+    fn from(store: wit_parser::Store) -> Store {
+        Store {
+            offset: store.offset,
+            mem: store.mem as usize,
         }
     }
 }
