@@ -28,7 +28,7 @@ pub trait Environment {
     ) -> Vec<Val>;
 
     fn host_export_signature(&self, ty: &Type) -> ir::Signature;
-    fn host_export_prologue(&self, ty: &Type, builder: &mut FunctionBuilder) -> Vec<Val>;
+    fn host_export_prologue(&self, ty: &Type, entry_block: ir::Block, builder: &mut FunctionBuilder) -> Vec<Val>;
     fn host_export_epilogue(&self, ty: &Type, results: &[Val], builder: &mut FunctionBuilder);
 }
 
@@ -48,7 +48,7 @@ pub const REF_TYPE: ir::Type = ir::types::R64;
 
 pub enum ImportValue<'a, E: Environment> {
     Wasm(ExportIdx, &'a E::Instance),
-    Host(&'a E::HostFunction),
+    Host(E::HostFunction),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,6 +61,18 @@ pub struct Interface {
 }
 
 impl Interface {
+    pub fn core_import(&self, core_import_func_idx: u32) -> (&AdapterFunction, &Type) {
+        let adapter_func_idx = self
+            .implements
+            .iter()
+            .find(|x| x.core_func_idx == core_import_func_idx as usize)
+            .expect("missing adapter implements")
+            .adapter_func_idx;
+        let adapter = self.local_adapter_func(adapter_func_idx);
+        let adapter_ty = &self.types[adapter.ty_idx];
+        (adapter, adapter_ty)
+    }
+
     pub fn parse(offset: usize, bytes: &[u8]) -> Result<Self, String> {
         let mut parser = WitParser::new(offset, bytes).unwrap();
         let mut interface = Interface::default();
@@ -103,7 +115,7 @@ impl Interface {
             .implements
             .iter()
             .find(|x| x.core_func_idx == core_func_idx)
-            .unwrap()
+            .expect("missing adapter implements")
             .adapter_func_idx;
         let adapter = self.local_adapter_func(adapter_func_idx);
         let adapter_ty = &self.types[adapter.ty_idx];
@@ -119,10 +131,10 @@ impl Interface {
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
 
-        let entry_block = builder.create_ebb();
+        let entry_block = builder.create_block();
 
-        builder.append_ebb_params_for_function_params(entry_block);
-        builder.append_ebb_params_for_function_returns(entry_block);
+        builder.append_block_params_for_function_params(entry_block);
+        // builder.append_block_params_for_function_returns(entry_block);
 
         builder.seal_block(entry_block);
         builder.switch_to_block(entry_block);
@@ -131,7 +143,7 @@ impl Interface {
 
         let mut caller_params = Vec::new();
         for (i, ty) in adapter_ty.params.iter().enumerate() {
-            let value = builder.ebb_params(entry_block)[i];
+            let value = builder.block_params(entry_block)[i];
             caller_params.push(Val::from_core_ty_and_ir(*ty, value));
         }
 
@@ -171,17 +183,17 @@ impl Interface {
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
 
-        let entry_block = builder.create_ebb();
+        let entry_block = builder.create_block();
 
-        builder.append_ebb_params_for_function_params(entry_block);
-        // builder.append_ebb_params_for_function_returns(entry_block);
+        builder.append_block_params_for_function_params(entry_block);
+        // builder.append_block_params_for_function_returns(entry_block);
 
         builder.seal_block(entry_block);
         builder.switch_to_block(entry_block);
 
         builder.set_srcloc(ir::SourceLoc::new(0));
 
-        let caller_params = env.host_export_prologue(adapter_ty, &mut builder);
+        let caller_params = env.host_export_prologue(adapter_ty, entry_block, &mut builder);
         let caller_results = self.emit_adapter(
             &mut builder,
             InterfaceSide::Callee,
@@ -220,8 +232,8 @@ impl Interface {
                 Instruction::ArgGet(arg_idx) => stack.push(params[*arg_idx]),
 
                 Instruction::MemoryToString(mem_idx) => {
-                    let len = stack.pop().unwrap();
-                    let base = stack.pop().unwrap();
+                    let len = stack.pop().expect("expected len");
+                    let base = stack.pop().expect("expected base");
                     assert!(len.ty() == ValType::I32);
                     assert!(base.ty() == ValType::I32);
                     stack.push(
@@ -234,9 +246,13 @@ impl Interface {
                     )
                 }
                 Instruction::StringToMemory(_string_to_memory) => {
-                    let string = stack.pop().unwrap();
+                    let string = stack.pop().expect("expected string");
                     assert!(string.ty() == ValType::String);
-                    unimplemented!()
+
+                    let base = Val::I32(builder.ins().iconst(ir::types::I32, 0));
+                    let len = Val::I32(builder.ins().iconst(ir::types::I32, 0));
+                    stack.push(base);
+                    stack.push(len);
                 }
 
                 Instruction::CallCore(func_idx) => {
@@ -303,8 +319,8 @@ impl Interface {
                 Instruction::I64Store16(store) |
                 Instruction::I64Store8(store) => {
                     assert!(store.mem == 0);
-                    let addr = stack.pop().unwrap().core_to_ir();
-                    let val = stack.pop().unwrap().core_to_ir();
+                    let addr = stack.pop().expect("expected addr").core_to_ir();
+                    let val = stack.pop().expect("expected val").core_to_ir();
                     builder.ins().store(ir::MemFlags::trusted(), val, addr, store.offset as i32);
                 },
                 _ => unimplemented!(),
@@ -461,10 +477,11 @@ pub enum Val {
     U64(ir::Value),
     // Complex interface types
     String(StringVal),
+    HostString(ir::Value),
 }
 
 impl Val {
-    fn from_core_ty_and_ir(ty: ValType, ir: ir::Value) -> Val {
+    pub fn from_core_ty_and_ir(ty: ValType, ir: ir::Value) -> Val {
         assert!(ty.is_core());
         match ty {
             ValType::I32 => Val::I32(ir),
@@ -502,16 +519,16 @@ impl Val {
             Val::U32(..) => ValType::U32,
             Val::U64(..) => ValType::U64,
             Val::String(..) => ValType::String,
+            Val::HostString(..) => ValType::String,
         }
     }
 
-    pub fn as_simple_ir(&self) -> Option<ir::Value> {
+    pub fn as_scalar_ir(&self) -> Option<ir::Value> {
         match self {
             Val::I32(val)
             | Val::I64(val)
             | Val::F32(val)
             | Val::F64(val)
-            | Val::Anyref(val)
             | Val::S8(val)
             | Val::S16(val)
             | Val::S32(val)
@@ -520,6 +537,25 @@ impl Val {
             | Val::U16(val)
             | Val::U32(val)
             | Val::U64(val) => Some(*val),
+            _ => None,
+        }
+    }
+
+    pub fn as_scalar_or_ref_ir(&self) -> Option<ir::Value> {
+        match self {
+            Val::I32(val)
+            | Val::I64(val)
+            | Val::F32(val)
+            | Val::F64(val)
+            | Val::S8(val)
+            | Val::S16(val)
+            | Val::S32(val)
+            | Val::S64(val)
+            | Val::U8(val)
+            | Val::U16(val)
+            | Val::U32(val)
+            | Val::U64(val)
+            | Val::Anyref(val) => Some(*val),
             _ => None,
         }
     }

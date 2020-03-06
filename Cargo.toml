@@ -5,8 +5,8 @@ authors = ["Ryan Hunt <rhunt@eqrion.net>"]
 edition = "2018"
 
 [dependencies]
-cranelift-entity = "0.56"
-cranelift-codegen = { version = "0.56", default-features = false }
-cranelift-frontend = "0.56"
+cranelift-entity = "0.57"
+cranelift-codegen = { version = "0.57", default-features = false }
+cranelift-frontend = "0.57"
 wasmparser = "0.47"
 wit-parser = { path = "../wasm-interface-types/crates/parser" }
