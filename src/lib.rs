@@ -10,6 +10,7 @@ pub trait Environment {
 
     fn interface(&self, instance: &Self::Instance) -> &Interface;
     fn function_type(&self, instance: &Self::Instance, func_idx: FunctionIdx) -> Type;
+    fn memory_base(&self, instance: &Self::Instance) -> *const u8;
 
     fn emit_call_core(
         &self,
@@ -319,7 +320,10 @@ impl Interface {
                 Instruction::I64Store16(store) |
                 Instruction::I64Store8(store) => {
                     assert!(store.mem == 0);
-                    let addr = stack.pop().expect("expected addr").core_to_ir();
+                    let base = builder.ins().iconst(POINTER_TYPE, env.memory_base(instance) as i64);
+                    let offset = stack.pop().expect("expected offset").core_to_ir();
+                    let offset = builder.ins().uextend(POINTER_TYPE, offset);
+                    let addr = builder.ins().iadd(base, offset);
                     let val = stack.pop().expect("expected val").core_to_ir();
                     builder.ins().store(ir::MemFlags::trusted(), val, addr, store.offset as i32);
                 },
@@ -335,7 +339,7 @@ impl Interface {
         idx < self.imports.len()
     }
 
-    fn local_adapter_func(&self, idx: AdapterIdx) -> &AdapterFunction {
+    pub fn local_adapter_func(&self, idx: AdapterIdx) -> &AdapterFunction {
         assert!(!self.adapter_func_is_imported(idx));
         &self.adapters[idx - self.imports.len()]
     }
@@ -659,7 +663,7 @@ impl<'a> From<wit_parser::Export<'a>> for Export {
 
 #[derive(Debug, Clone)]
 pub struct AdapterFunction {
-    ty_idx: TypeIdx,
+    pub ty_idx: TypeIdx,
     instrs: Vec<Instruction>,
 }
 
