@@ -12,6 +12,15 @@ pub trait Environment {
     fn function_type(&self, instance: &Self::Instance, func_idx: FunctionIdx) -> Type;
     fn memory_base(&self, instance: &Self::Instance) -> *const u8;
 
+    fn emit_table_set(
+        &self,
+        builder: &mut FunctionBuilder,
+        instance: &Self::Instance,
+        table_index: u32,
+        index: ir::Value,
+        anyref: ir::Value,
+    );
+
     fn emit_call_core(
         &self,
         instance: &Self::Instance,
@@ -27,6 +36,9 @@ pub trait Environment {
         params: &[Val],
         builder: &mut FunctionBuilder,
     ) -> Vec<Val>;
+
+    fn emit_host_string_length(&self, host_string: ir::Value, builder: &mut FunctionBuilder) -> ir::Value;
+    fn emit_host_string_copy(&self, host_string: ir::Value, dest_addr: ir::Value, builder: &mut FunctionBuilder);
 
     fn host_export_signature(&self, ty: &Type) -> ir::Signature;
     fn host_export_prologue(&self, ty: &Type, entry_block: ir::Block, builder: &mut FunctionBuilder) -> Vec<Val>;
@@ -100,8 +112,16 @@ impl Interface {
             }
         }
 
-        eprintln!("{:#?}", interface);
         Ok(interface)
+    }
+
+    /// Tests whether this interface section has a core-import implements.
+    pub fn has_core_import(&self, core_func_idx: FunctionIdx) -> bool {
+        self
+            .implements
+            .iter()
+            .find(|x| x.core_func_idx == core_func_idx)
+            .is_some()
     }
 
     /// Emits an adapted function that implements a core-import for this interface and follows the Wasm ABI.
@@ -246,14 +266,31 @@ impl Interface {
                         .into(),
                     )
                 }
-                Instruction::StringToMemory(_string_to_memory) => {
+                Instruction::StringToMemory(string_to_memory) => {
                     let string = stack.pop().expect("expected string");
                     assert!(string.ty() == ValType::String);
+                    assert!(string_to_memory.mem == 0);
 
-                    let base = Val::I32(builder.ins().iconst(ir::types::I32, 0));
-                    let len = Val::I32(builder.ins().iconst(ir::types::I32, 0));
-                    stack.push(base);
-                    stack.push(len);
+                    match string {
+                        Val::String(..) => unimplemented!(),
+                        Val::HostString(host_str) => {
+                            // Call host for length of string
+                            let len = env.emit_host_string_length(host_str, builder);
+                            // Call $malloc with length of string and receive offset
+                            let malloc_results = env.emit_call_core(instance, string_to_memory.malloc, &[Val::from_core_ty_and_ir(ValType::I32, len)], builder);
+                            let base = malloc_results[0];
+
+                            // Call host to copy string to wasm memory + offset
+                            let heap = builder.ins().iconst(POINTER_TYPE, env.memory_base(instance) as i64);
+                            let base_ext = builder.ins().uextend(POINTER_TYPE, base.core_to_ir());
+                            let base_addr = builder.ins().iadd(heap, base_ext);
+                            env.emit_host_string_copy(host_str, base_addr, builder);
+                            // Return base and length
+                            stack.push(base);
+                            stack.push(Val::from_core_ty_and_ir(ValType::I32, len));
+                        }
+                        _ => unimplemented!()
+                    }
                 }
 
                 Instruction::CallCore(func_idx) => {
@@ -320,14 +357,79 @@ impl Interface {
                 Instruction::I64Store16(store) |
                 Instruction::I64Store8(store) => {
                     assert!(store.mem == 0);
-                    let base = builder.ins().iconst(POINTER_TYPE, env.memory_base(instance) as i64);
+                    let word_size = match instr {
+                        Instruction::I32Store(_) => 4,
+                        Instruction::I32Store16(_) => 2,
+                        Instruction::I32Store8(_) => 1,
+                        Instruction::I64Store(_) => 8,
+                        Instruction::I64Store32(_) => 4,
+                        Instruction::I64Store16(_) => 2,
+                        Instruction::I64Store8(_) => 1,
+                        _ => unreachable!(),
+                    };
+                    let heap = builder.ins().iconst(POINTER_TYPE, env.memory_base(instance) as i64);
                     let offset = stack.pop().expect("expected offset").core_to_ir();
-                    let offset = builder.ins().uextend(POINTER_TYPE, offset);
-                    let addr = builder.ins().iadd(base, offset);
+                    let offset_uext = builder.ins().uextend(POINTER_TYPE, offset);
+                    let addr = builder.ins().iadd(heap, offset_uext);
                     let val = stack.pop().expect("expected val").core_to_ir();
-                    builder.ins().store(ir::MemFlags::trusted(), val, addr, store.offset as i32);
+                    builder.ins().store(ir::MemFlags::trusted(), val, addr, (store.offset as i32) * word_size);
                 },
-                _ => unimplemented!(),
+
+                Instruction::I32FromBool => {
+                    let b = stack.pop().expect("expected");
+                    match b {
+                        Val::Bool(x) => stack.push(Val::I32(x)),
+                        _ => panic!(),
+                    }
+                }
+                Instruction::BoolFromI32 => {
+                    let b = stack.pop().expect("expected");
+                    match b {
+                        Val::I32(x) => stack.push(Val::Bool(x)),
+                        _ => panic!(),
+                    }
+                }
+                Instruction::U32ToI32 => {
+                    let b = stack.pop().expect("expected");
+                    match b {
+                        Val::U32(x) => stack.push(Val::I32(x)),
+                        _ => panic!(),
+                    }
+                }
+                Instruction::I32ToU32 => {
+                    let b = stack.pop().expect("expected");
+                    match b {
+                        Val::I32(x) => stack.push(Val::U32(x)),
+                        _ => panic!(),
+                    }
+                }
+                Instruction::S32ToI32 => {
+                    let b = stack.pop().expect("expected");
+                    match b {
+                        Val::S32(x) => stack.push(Val::I32(x)),
+                        _ => panic!(),
+                    }
+                }
+                Instruction::I32ToS32 => {
+                    let b = stack.pop().expect("expected");
+                    match b {
+                        Val::I32(x) => stack.push(Val::S32(x)),
+                        _ => panic!(),
+                    }
+                }
+                Instruction::AnyrefTableTee => {
+                    // pop index
+                    // pop anyref
+                    // set table[1][index] = anyref
+                    // push index
+                    let index = stack.pop().expect("expected index").core_to_ir();
+                    let anyref = stack.pop().expect("expected anyref").core_to_ir();
+                    let anyref_table_index = 1;
+                    env.emit_table_set(builder, instance, anyref_table_index, index, anyref);
+                    stack.push(Val::I32(index));
+                }
+
+                _ => unimplemented!("{:?}", instr),
             }
         }
 
@@ -369,6 +471,7 @@ pub enum ValType {
     F64,
     Anyref,
     // Interface types
+    Bool,
     S8,
     S16,
     S32,
@@ -407,6 +510,7 @@ impl ValType {
     pub fn ir_type(&self) -> ir::Type {
         assert!(self.is_simple());
         match self {
+            ValType::Bool => ir::types::I32,
             ValType::U8 | ValType::S8 => ir::types::I8,
             ValType::U16 | ValType::S16 => ir::types::I16,
             ValType::I32 | ValType::U32 | ValType::S32 => ir::types::I32,
@@ -444,6 +548,7 @@ impl ValType {
 impl From<wit_parser::ValType> for ValType {
     fn from(val: wit_parser::ValType) -> ValType {
         match val {
+            wit_parser::ValType::Bool => ValType::Bool,
             wit_parser::ValType::I32 => ValType::I32,
             wit_parser::ValType::I64 => ValType::I64,
             wit_parser::ValType::F32 => ValType::F32,
@@ -471,6 +576,7 @@ pub enum Val {
     F64(ir::Value),
     Anyref(ir::Value),
     // Interface types
+    Bool(ir::Value),
     S8(ir::Value),
     S16(ir::Value),
     S32(ir::Value),
@@ -486,19 +592,26 @@ pub enum Val {
 
 impl Val {
     pub fn from_core_ty_and_ir(ty: ValType, ir: ir::Value) -> Val {
-        assert!(ty.is_core());
         match ty {
             ValType::I32 => Val::I32(ir),
             ValType::I64 => Val::I64(ir),
             ValType::F32 => Val::F32(ir),
             ValType::F64 => Val::F64(ir),
             ValType::Anyref => Val::Anyref(ir),
+            ValType::Bool => Val::Bool(ir),
+            ValType::S8 => Val::S8(ir),
+            ValType::S16 => Val::S16(ir),
+            ValType::S32 => Val::S32(ir),
+            ValType::S64 => Val::S64(ir),
+            ValType::U8 => Val::U8(ir),
+            ValType::U16 => Val::U16(ir),
+            ValType::U32 => Val::U32(ir),
+            ValType::U64 => Val::U64(ir),
             _ => unreachable!(),
         }
     }
 
     fn core_to_ir(&self) -> ir::Value {
-        assert!(self.ty().is_core());
         match self {
             Val::I32(val) | Val::I64(val) | Val::F32(val) | Val::F64(val) | Val::Anyref(val) => {
                 *val
@@ -514,6 +627,7 @@ impl Val {
             Val::F32(..) => ValType::F32,
             Val::F64(..) => ValType::F64,
             Val::Anyref(..) => ValType::Anyref,
+            Val::Bool(..) => ValType::Bool,
             Val::S8(..) => ValType::S8,
             Val::S16(..) => ValType::S16,
             Val::S32(..) => ValType::S32,
@@ -540,7 +654,8 @@ impl Val {
             | Val::U8(val)
             | Val::U16(val)
             | Val::U32(val)
-            | Val::U64(val) => Some(*val),
+            | Val::U64(val)
+            | Val::Bool(val) => Some(*val),
             _ => None,
         }
     }
@@ -559,6 +674,7 @@ impl Val {
             | Val::U16(val)
             | Val::U32(val)
             | Val::U64(val)
+            | Val::Bool(val)
             | Val::Anyref(val) => Some(*val),
             _ => None,
         }
@@ -744,6 +860,10 @@ pub enum Instruction {
     S64ToI64,
     U64ToI64,
 
+    I32FromBool,
+    BoolFromI32,
+    AnyrefTableTee,
+
     I32Store(Store),
     I32Store16(Store),
     I32Store8(Store),
@@ -806,6 +926,10 @@ impl From<wit_parser::Instruction> for Instruction {
             wit_parser::Instruction::U32ToI64 => Instruction::U32ToI64,
             wit_parser::Instruction::S64ToI64 => Instruction::S64ToI64,
             wit_parser::Instruction::U64ToI64 => Instruction::U64ToI64,
+
+            wit_parser::Instruction::I32FromBool => Instruction::I32FromBool,
+            wit_parser::Instruction::BoolFromI32 => Instruction::BoolFromI32,
+            wit_parser::Instruction::AnyrefTableTee => Instruction::AnyrefTableTee,
 
             wit_parser::Instruction::I32Store(store) => Instruction::I32Store(store.into()),
             wit_parser::Instruction::I32Store16(store) => Instruction::I32Store16(store.into()),
